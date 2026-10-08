@@ -6,6 +6,7 @@ venv/
 .venv/
 env/
 laptop_app/notes.md
+laptop_app/debug_audio/
 
 # PlatformIO / Arduino
 .pio/

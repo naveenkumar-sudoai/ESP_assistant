@@ -64,4 +64,38 @@
 #define SOUND_THRESHOLD      2000   // analog level (0..4095) above which the LED lights
 #define SOUND_LED_ON_MS      120    // how long the LED stays lit after detection
 
+// ---------------------------------------------------------------------------
+// Audio source + on-device microphone (INMP441 I2S MEMS mic).
+//
+// AUDIO_SOURCE_ESP32 (numeric — used in #if, so 1/0, not true/false):
+//   1 -> the ESP32 captures audio with the INMP441 and streams it to the
+//        laptop. Set the laptop's .env AUDIO_SOURCE=esp32 to match.
+//   0 -> original behaviour: the ESP32 only sends start/stop events and the
+//        laptop records with its own microphone. This is the safe default.
+// ---------------------------------------------------------------------------
+#define AUDIO_SOURCE_ESP32 0
+
+// INMP441 wiring (3.3V ONLY, never 5V). All three are safe, non-strapping GPIOs.
+//   VDD->3.3V  GND->GND  SCK->GPIO14  WS->GPIO27  SD->GPIO13  L/R->GND (left)
+#define PIN_I2S_BCK   14
+#define PIN_I2S_WS    27
+#define PIN_I2S_SD    13
+
+#define I2S_SAMPLE_RATE   16000   // Hz; must match the laptop's SAMPLE_RATE (16000)
+#define I2S_PCM_SHIFT     16      // 24-bit -> 16-bit shift: 16=unity, 15=+6dB, 14=+12dB
+#define I2S_GAIN_PERCENT  100     // extra gain after the shift (100 = none), then clipped
+#define I2S_REMOVE_DC     true    // remove DC offset with a 1st-order high-pass filter
+#define I2S_DC_COEF       0.999f  // DC-blocker coefficient (closer to 1.0 = gentler)
+
+// Streaming: 16-bit PCM is sent to the laptop in small HTTP chunks from a FreeRTOS
+// capture task through a ring buffer, so the OLED/button/server loop never drops
+// samples. Chunk size is a balance: smaller = lower latency but more HTTP posts.
+#define I2S_CHUNK_SAMPLES 1024    // samples per HTTP POST (64 ms at 16 kHz)
+#define I2S_READ_SAMPLES  256     // raw 32-bit samples per i2s_read() call
+#define AUDIO_QUEUE_LEN   32      // ring-buffer slots between capture and send (~2 s)
+
+// Recording limits.
+#define MAX_RECORD_MS     20000   // hard cap on a single utterance
+#define MIN_RECORD_MS     300     // ignore hold-taps shorter than this ("Hold to speak")
+
 #endif
