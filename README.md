@@ -12,6 +12,10 @@ A two-part, hardware voice assistant for a demo deadline:
 They talk to each other over your **local Wi-Fi network** with plain HTTP.
 No cloud server, no app store, no accounts beyond a DeepSeek API key.
 
+> **Want the on-device microphone (INMP441) version?** See the
+> [`esp32-mic/`](esp32-mic/) folder — same assistant, but the mic is on the
+> ESP32 instead of the laptop. It's wired, flashed, and documented separately.
+
 ---
 
 ## 1. What you need
@@ -24,7 +28,6 @@ No cloud server, no app store, no accounts beyond a DeepSeek API key.
 | 3 × tactile push buttons | Normally-open, momentary |
 | 1 × LED + ~220–330 Ω resistor | Status indicator |
 | KY-038 sound sensor (optional) | Cosmetic "listening" LED trigger |
-| INMP441 I2S MEMS mic breakout (optional) | On-device mic for ESP32-mic mode (see §6) |
 | USB cable + breadboard/jumper wires | |
 
 ### Software (on the laptop)
@@ -58,11 +61,6 @@ No cloud server, no app store, no accounts beyond a DeepSeek API key.
 3. You **release** the button. The ESP32 shows "Thinking".
 4. The laptop runs speech-to-text → DeepSeek → a short answer, then posts it
    to the ESP32, which shows it on the OLED (scrolling if it's long).
-
-> **Two audio sources.** By default the laptop records your voice. You can
-> optionally add an INMP441 I2S mic to the ESP32 instead, so the ESP32 captures
-> and streams audio while you hold button 3 (see §6). Everything downstream —
-> speech-to-text, DeepSeek, Markdown logging — is identical either way.
 
 The laptop **learns the ESP32's IP automatically** the first time the ESP32
 contacts it — you only need to tell the *ESP32* the *laptop's* IP (once,
@@ -161,13 +159,8 @@ Everything else has a sensible default. See the table:
 | `OPENAI_API_KEY` | Only if `STT_BACKEND=openai` | *(empty)* |
 | `ESP32_IP` | Leave empty (auto-detected) | *(empty)* |
 | `ESP32_PORT` | The ESP32's HTTP port | `80` |
-| `AUDIO_SOURCE` | `laptop` (laptop mic) or `esp32` (INMP441 mic on the ESP32, see §6) | `laptop` |
-| `DEBUG_AUDIO` | `true` saves the last ESP32-mic WAV to `debug_audio/` | `false` |
 | `LAPTOP_HOST` | Keep `0.0.0.0` so the ESP32 can reach you | `0.0.0.0` |
 | `LAPTOP_PORT` | Port the laptop listens on | `5000` |
-
-> **`AUDIO_SOURCE` must match the firmware.** If you set `AUDIO_SOURCE=esp32`
-> here, also set `AUDIO_SOURCE_ESP32=true` in `esp32_firmware/src/config.h` (see §6).
 
 > **Where do I get a DeepSeek API key?** Go to https://platform.deepseek.com,
 > sign up, and create an API key in the dashboard. Paste it after
@@ -296,136 +289,11 @@ enables each pin's internal pull-up, so no external resistor is needed.
 are input-only pins (no internal pull-ups) — perfect for the sensor, which
 drives them actively. None of these conflict with boot/strapping pins or I2C.
 
-> **Adding the INMP441 mic?** Its wiring (GPIO 13/14/27) is in §6.1 — it also
-> doesn't clash with any of the pins above.
-
 ---
 
-## 6. ESP32 on-device microphone (INMP441, optional)
+## 6. Run the demo
 
-By default the **laptop** records your voice with its own microphone. You can
-optionally add a small **INMP441 I2S MEMS microphone** to the ESP32 instead:
-while you hold button 3, the ESP32 captures 16 kHz mono audio and streams it to
-the laptop over Wi-Fi; on release the laptop transcribes it exactly as before.
-This frees you from the laptop's mic and makes the thing feel like a
-self-contained voice box.
-
-The two sides are switched independently and **must agree**:
-
-| Side | Setting | Where |
-|------|---------|-------|
-| ESP32 | `AUDIO_SOURCE_ESP32` (`true`/`false`) | `esp32_firmware/src/config.h` |
-| Laptop | `AUDIO_SOURCE` (`laptop`/`esp32`) | `laptop_app/.env` |
-
-`AUDIO_SOURCE_ESP32=false` + `AUDIO_SOURCE=laptop` = the original laptop-mic
-setup, unchanged. The ESP32 mic is purely additive.
-
-### 6.1 Wiring (3.3 V ONLY — never 5 V)
-
-The INMP441 is a 3.3 V part. Feeding it 5 V can destroy it.
-
-| INMP441 pin | Connect to | Notes |
-|-------------|------------|-------|
-| VDD | ESP32 **3.3 V** | **not** 5 V |
-| GND | ESP32 GND | |
-| SCK | GPIO **14** | bit clock (ESP32 output) |
-| WS | GPIO **27** | word select / LRCL (ESP32 output) |
-| SD | GPIO **13** | data out (ESP32 input) |
-| L/R | ESP32 GND | selects the **LEFT** channel |
-
-These three GPIOs (13/14/27) are safe general-purpose pins — none is a boot
-strapping pin (0/2/5/12/15), a flash pin (6–11), or input-only (34–39). They
-don't clash with the OLED (21/22), buttons (32/33/25), LED (26), or sound sensor
-(34/35). If your board differs, the pins are configurable in `config.h`.
-
-### 6.2 Flash the mic test sketch FIRST
-
-Before flashing the main firmware, flash the tiny bring-up test so you can
-confirm the wiring and gain in under a minute:
-
-1. In VS Code, open the **`esp32_firmware/tests/i2s_mic_test`** folder.
-2. Connect the ESP32 and click **Upload** (the test is its own mini project).
-3. Open the **Serial Plotter** (or `pio device monitor`) at **115200 baud**.
-4. Talk or tap the mic. The plot shows three traces — `peak`, `rms`, `level`.
-   A flat `0` means the mic isn't connected / is on the wrong channel; a trace
-   pinned at the top means clipping. See §6.5 for what each means and how to fix it.
-
-The test shares `config.h` + `mic_i2s.h` with the main firmware, so the pins and
-gain you verify here are exactly what the real firmware will use.
-
-### 6.3 Switch the audio source
-
-**Firmware** — edit `esp32_firmware/src/config.h`:
-
-```c
-#define AUDIO_SOURCE_ESP32 true   // true = INMP441 mic, false = laptop mic
-```
-
-(Also set `WIFI_SSID`, `WIFI_PASSWORD` and `LAPTOP_IP` as usual — see §4.)
-
-**Laptop** — edit `laptop_app/.env`:
-
-```
-AUDIO_SOURCE=esp32
-DEBUG_AUDIO=true     # optional: save debug_audio/last.wav to check quality
-```
-
-Then flash the main firmware (`esp32_firmware`) and start the laptop app
-(`python main.py`). The two values must match: `AUDIO_SOURCE_ESP32=true` on the
-firmware means `AUDIO_SOURCE=esp32` on the laptop.
-
-### 6.4 Demo checklist (ESP32-mic mode)
-
-- [ ] Mic wired per §6.1; the test sketch (§6.2) shows a live level.
-- [ ] `AUDIO_SOURCE_ESP32=true` in `config.h`; main firmware re-flashed.
-- [ ] `AUDIO_SOURCE=esp32` in `.env`; laptop app running (`python main.py`).
-- [ ] Both devices on the **same Wi-Fi** network.
-- [ ] Hold button 3 → "Listening" + LED on → speak → release → "Thinking" → answer.
-- [ ] A tap under ~0.3 s shows "Hold to speak" and does nothing.
-- [ ] Holding longer than 20 s auto-stops and still returns an answer.
-- [ ] (If `DEBUG_AUDIO=true`) `python tools/play_last_audio.py` plays back your voice.
-
-### 6.5 MIC TROUBLESHOOTING
-
-**Silent audio / flat line on the plotter**
-→ Check L/R is tied to GND (LEFT channel) and that the firmware reads
-`I2S_CHANNEL_FMT_ONLY_LEFT` (it does). Confirm SD→13, SCK→14, WS→27, and VDD on
-**3.3 V** (not 5 V).
-
-**Noise / garbage / robotic audio**
-→ Wrong slot width or shift. The INMP441 is 24-bit in a 32-bit slot; the default
-`I2S_PCM_SHIFT 16` is unity gain. Re-flash the test sketch and confirm the trace
-moves with your voice (not a random full-scale hash). If the trace is garbage,
-check the wiring and clock first — don't blindly change the shift.
-
-**Audio too quiet (low level on the plotter)**
-→ Lower `I2S_PCM_SHIFT` to 15 or 14 (+6 / +12 dB) or raise `I2S_GAIN_PERCENT`
-above 100 in `config.h`.
-
-**Clipping / distortion on loud sounds**
-→ Reduce gain: raise `I2S_PCM_SHIFT` toward 16 (or above) or lower
-`I2S_GAIN_PERCENT` below 100 in `config.h`.
-
-**Choppy / stuttering audio**
-→ Wi-Fi or buffer pressure. Try a smaller `I2S_CHUNK_SAMPLES` (e.g. 512) or a
-larger `AUDIO_QUEUE_LEN` (e.g. 32) in `config.h`. Make sure the laptop and ESP32
-are on the same network (no guest isolation).
-
-**Wrong speed / pitch**
-→ Sample-rate mismatch. `I2S_SAMPLE_RATE` in `config.h` must be 16000 (matching
-the laptop's `SAMPLE_RATE`). Both defaults are already 16000.
-
-**"Mic init failed" on the OLED**
-→ `i2s_driver_install`/`i2s_set_pin` failed. Check the serial monitor for the
-`[i2s]` line, and confirm no other pin in `config.h` reuses 13/14/27.
-
----
-
-## 7. Run the demo
-
-> **ESP32-mic mode?** Skip this section and use the §6.4 checklist instead.
-
-### 7.1 Start the laptop app
+### 6.1 Start the laptop app
 
 ```bash
 # in the laptop_app/ folder, with the venv activated:
@@ -444,11 +312,11 @@ Waiting for the ESP32 to connect...
 
 Leave it running.
 
-### 7.2 Power on the ESP32
+### 6.2 Power on the ESP32
 
 Confirm the OLED shows `Ready!` + an IP address, then the Home screen.
 
-### 7.3 Test each button
+### 6.3 Test each button
 
 1. **Button 3 (hold-to-speak):** hold it, say *"What is the capital of
    France?"*, release. OLED: `Listening` → `Thinking` → the answer.
@@ -461,10 +329,7 @@ Confirm the OLED shows `Ready!` + an IP address, then the Home screen.
 
 ---
 
-## 8. Demo checklist
-
-> **ESP32-mic mode?** Use the §6.4 checklist instead — this one is for the
-> default laptop-mic setup.
+## 7. Demo checklist
 
 - [ ] ESP32 powered, OLED shows `Ready!` + IP, then Home screen.
 - [ ] Laptop app running (`python main.py`), prints its IP.
@@ -476,9 +341,7 @@ Confirm the OLED shows `Ready!` + an IP address, then the Home screen.
 
 ---
 
-## 9. Troubleshooting
-
-> **ESP32-mic problems?** See §6.5 "MIC TROUBLESHOOTING" first.
+## 8. Troubleshooting
 
 **ESP32 shows "WiFi failed"**
 → Wrong SSID/password in `config.h`. Fix, re-flash.
@@ -537,7 +400,7 @@ display but **are** preserved in full in `notes.md`.
 
 ---
 
-## 10. How it works (short)
+## 9. How it works (short)
 
 - **ESP32:** runs a small `WebServer` on port 80. Buttons are debounced in
   software; the hold-to-speak button sends `GET /start_listening?mode=…` on
@@ -549,17 +412,10 @@ display but **are** preserved in full in `notes.md`.
   On release, a background thread runs STT → DeepSeek → sanitize → POST to
   the ESP32's `/display`. Summarize/To-Do modes also write a full version to
   `notes.md`.
-- **ESP32 (mic mode):** with `AUDIO_SOURCE_ESP32=true`, a FreeRTOS capture task
-  reads the INMP441 over I2S and pushes 16-bit PCM through a ring buffer; a
-  sender task POSTs small chunks to the laptop's `/audio_chunk` with a session
-  id and chunk index. On `/stop_listening` the laptop assembles the chunks in
-  order into a 16 kHz mono float32 array and hands it to the *same* STT path as
-  the laptop mic (optionally also writing `debug_audio/last.wav` when
-  `DEBUG_AUDIO=true`). Nothing downstream (prompts, DeepSeek, `notes.md`) changes.
 
 ---
 
-## 11. Project layout
+## 10. Project layout
 
 ```
 .
@@ -567,20 +423,12 @@ display but **are** preserved in full in `notes.md`.
 ├── .gitignore
 ├── esp32_firmware/          # Part B — the "face"
 │   ├── platformio.ini
-│   ├── src/
-│   │   ├── config.h         # Wi-Fi + IP + pins + audio tunables (EDIT THIS)
-│   │   ├── mic_i2s.h        # INMP441 I2S init + 24-bit->16-bit conversion
-│   │   └── main.cpp         # all firmware logic
-│   └── tests/
-│       └── i2s_mic_test/    # mic bring-up sketch (flash this first)
-│           ├── platformio.ini
-│           └── src/main.cpp
+│   └── src/
+│       ├── config.h         # Wi-Fi + IP + pins + tunables (EDIT THIS)
+│       └── main.cpp         # all firmware logic
 └── laptop_app/              # Part A — the "brain"
     ├── main.py              # single entry point: python main.py
     ├── requirements.txt
     ├── .env.example         # copy to .env and add your key
-    ├── tools/
-    │   └── play_last_audio.py   # play back debug_audio/last.wav
-    ├── debug_audio/         # created at runtime (when DEBUG_AUDIO=true)
     └── notes.md             # created at runtime (Summarize/To-Do logs)
 ```

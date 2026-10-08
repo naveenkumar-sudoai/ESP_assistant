@@ -24,6 +24,7 @@ import wave
 from datetime import datetime
 
 import numpy as np
+import sounddevice as sd
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -53,20 +54,6 @@ LAPTOP_PORT = _env_int("LAPTOP_PORT", 5000)
 SAMPLE_RATE = 16000
 MAX_RECORD_SECONDS = 30.0
 
-# --- audio source ---------------------------------------------------------------
-# "laptop" = the laptop's own microphone (sounddevice) — the original path.
-# "esp32"  = the ESP32 captures audio with an INMP441 I2S mic and streams it here.
-AUDIO_SOURCE = os.getenv("AUDIO_SOURCE", "laptop").strip().lower()
-
-# Save the last ESP32-mic utterance to debug_audio/last.wav so mic quality can be
-# checked by playing it back (see tools/play_last_audio.py).
-DEBUG_AUDIO = os.getenv("DEBUG_AUDIO", "false").strip().lower() in ("1", "true", "yes", "on")
-
-# How long an esp32 streaming session may sit idle before it is discarded as stale.
-SESSION_TIMEOUT_SECONDS = 30.0
-
-DIDNT_CATCH = "I didn't catch that. Please try again."
-
 NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.md")
 
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
@@ -93,7 +80,6 @@ class AudioRecorder:
     def start(self):
         if self.recording:
             return
-        import sounddevice as sd   # lazy: only the laptop-mic path needs PortAudio
         with self.lock:
             self.frames = []
         try:
@@ -271,7 +257,7 @@ def append_note(mode, transcript, full):
 def process_utterance(audio, mode):
     text = transcribe(audio)
     if not text:
-        return DIDNT_CATCH
+        return "I didn't catch that. Please try again."
 
     short_sys, full_sys = build_prompts(mode, text)
 
@@ -332,83 +318,6 @@ def pipeline_worker(audio, mode):
         post_to_esp32("Something went wrong.")
 
 
-# ------------------------------------------------------------ ESP32 mic sessions --
-# In "esp32" mode the ESP32 streams 16-bit PCM chunks to /audio_chunk. We assemble
-# them per session, keyed by the session id the ESP32 generates at press time, then
-# hand the finished audio to the SAME transcribe() path the laptop mic uses.
-sessions = {}            # session_id -> {"mode": str, "chunks": {index: bytes}, "last": float}
-sessions_lock = threading.Lock()
-
-
-def save_debug_wav(pcm16: bytes):
-    """Write a 16 kHz mono 16-bit WAV to debug_audio/ (for playback/quality checks)."""
-    try:
-        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_audio")
-        os.makedirs(out_dir, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        for name in (os.path.join(out_dir, "last.wav"),
-                     os.path.join(out_dir, f"rec_{stamp}.wav")):
-            with wave.open(name, "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(SAMPLE_RATE)
-                w.writeframes(pcm16)
-        print(f"[audio] saved debug WAV -> {os.path.join(out_dir, 'last.wav')}")
-    except OSError as e:
-        print(f"[audio] debug WAV save error: {e}")
-
-
-# Full chunk size in bytes; keep in sync with I2S_CHUNK_SAMPLES in the firmware's
-# config.h (used to insert silence for any chunk index that never arrived).
-ESP32_CHUNK_SAMPLES = 1024
-ESP32_CHUNK_BYTES = ESP32_CHUNK_SAMPLES * 2
-
-
-def assemble_esp32_audio(s):
-    """Return (float32_audio, pcm16_bytes) for an ordered set of PCM16 chunks."""
-    chunks = s["chunks"]
-    indexes = sorted(chunks)
-
-    # Only the final chunk may be shorter than a full chunk, so the modal length
-    # is the full-chunk size used to repair any gaps.
-    size_counts = {}
-    for b in chunks.values():
-        size_counts[len(b)] = size_counts.get(len(b), 0) + 1
-    chunk_bytes = max(size_counts, key=size_counts.get) if size_counts else ESP32_CHUNK_BYTES
-
-    # Concatenate in order, inserting silence for any missing index so a dropped
-    # chunk does NOT compress the timeline (which would corrupt transcription).
-    parts = []
-    prev = indexes[0] - 1
-    for i in indexes:
-        gap = i - prev - 1
-        if gap > 0:
-            parts.append(b"\x00" * (gap * chunk_bytes))
-            print(f"[audio] inserted {gap * chunk_bytes} bytes of silence "
-                  f"for {gap} missing chunk index(es)")
-        parts.append(chunks[i])
-        prev = i
-    pcm = b"".join(parts)
-
-    if len(pcm) % 2:                       # guard: keep an even byte count for int16
-        pcm = pcm[:-1]
-    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    return audio, pcm
-
-
-def session_reaper():
-    """Discard esp32 sessions that never sent /stop_listening (e.g. the ESP32 dropped)."""
-    while True:
-        time.sleep(5)
-        now = time.time()
-        with sessions_lock:
-            stale = [sid for sid, s in sessions.items()
-                     if now - s["last"] > SESSION_TIMEOUT_SECONDS]
-            for sid in stale:
-                sessions.pop(sid, None)
-                print(f"[audio] session {sid} timed out (no /stop_listening)")
-
-
 @app.route("/start_listening", methods=["GET", "POST"])
 def start_listening():
     global current_mode
@@ -416,15 +325,6 @@ def start_listening():
     if m in ("home", "summarize", "todo"):
         current_mode = m
     learn_esp_ip()
-
-    if AUDIO_SOURCE == "esp32":
-        sid = request.args.get("session") or str(int(time.time() * 1000))
-        mode_for_session = m if m in ("home", "summarize", "todo") else "home"
-        with sessions_lock:
-            sessions[sid] = {"mode": mode_for_session, "chunks": {}, "last": time.time()}
-        print(f"[audio] esp32 session {sid} started (mode={mode_for_session})")
-        return jsonify({"status": "ok", "session": sid})
-
     try:
         recorder.start()
     except Exception as e:
@@ -433,59 +333,9 @@ def start_listening():
     return jsonify({"status": "ok", "mode": current_mode})
 
 
-@app.route("/audio_chunk", methods=["POST"])
-def audio_chunk():
-    sid = request.args.get("session", "")
-    idx = request.args.get("index", "")
-    data = request.get_data()
-    if not sid or not data:
-        return ("missing session or data", 400)
-    try:
-        idx_i = int(idx)
-    except ValueError:
-        return ("bad index", 400)
-    with sessions_lock:
-        s = sessions.get(sid)
-        if s is None:
-            s = {"mode": "home", "chunks": {}, "last": time.time()}
-            sessions[sid] = s
-        s["chunks"][idx_i] = data
-        s["last"] = time.time()
-    return ("ok", 200)
-
-
-@app.route("/cancel", methods=["GET", "POST"])
-def cancel_session():
-    sid = request.args.get("session", "")
-    with sessions_lock:
-        sessions.pop(sid, None)
-    print(f"[audio] session {sid} cancelled (tap too short)")
-    return ("ok", 200)
-
-
 @app.route("/stop_listening", methods=["GET", "POST"])
 def stop_listening():
     learn_esp_ip()
-
-    if AUDIO_SOURCE == "esp32":
-        sid = request.args.get("session", "")
-        with sessions_lock:
-            s = sessions.pop(sid, None)
-        if not s or not s.get("chunks"):
-            print("[audio] no audio captured for session")
-            post_to_esp32(DIDNT_CATCH)
-            return jsonify({"status": "ok", "thinking": False})
-        audio, pcm = assemble_esp32_audio(s)
-        print(f"[audio] assembled {len(pcm)} bytes "
-              f"({audio.shape[0] / SAMPLE_RATE:.2f}s, {len(s['chunks'])} chunks)")
-        if audio.shape[0] < SAMPLE_RATE * 0.3:
-            post_to_esp32(DIDNT_CATCH)
-            return jsonify({"status": "ok", "thinking": False})
-        if DEBUG_AUDIO:
-            save_debug_wav(pcm)
-        threading.Thread(target=pipeline_worker, args=(audio, s["mode"]), daemon=True).start()
-        return jsonify({"status": "ok", "thinking": True})
-
     audio = recorder.stop()
     threading.Thread(target=pipeline_worker, args=(audio, current_mode), daemon=True).start()
     return jsonify({"status": "ok", "thinking": True})
@@ -517,13 +367,6 @@ def print_laptop_ip():
 
 def check_audio():
     try:
-        import sounddevice as sd
-    except Exception as e:
-        print("WARNING: sounddevice is not installed — recording will fail.")
-        print(f"  ({e})")
-        print("  Install it: pip install sounddevice")
-        return
-    try:
         devices = sd.query_devices()
         n_in = sum(1 for d in devices if d.get("max_input_channels", 0) > 0)
         if n_in == 0:
@@ -544,15 +387,8 @@ def main():
     if not DEEPSEEK_API_KEY:
         print("WARNING: DEEPSEEK_API_KEY is not set in .env — LLM calls will fail.")
     print(f"  STT backend : {STT_BACKEND}")
-    print(f"  Audio source: {AUDIO_SOURCE}")
     print(f"  Notes file  : {NOTES_FILE}")
-    # Always reap stray sessions (a no-op in laptop mode, but a guard against a
-    # firmware/laptop source mismatch leaving /audio_chunk sessions behind).
-    threading.Thread(target=session_reaper, daemon=True).start()
-    if AUDIO_SOURCE == "laptop":
-        check_audio()
-    else:
-        print("  (ESP32 mic mode: /audio_chunk streaming enabled)")
+    check_audio()
     print_laptop_ip()
     print(f"  Serving on  : http://{LAPTOP_HOST}:{LAPTOP_PORT}")
     print("  Waiting for the ESP32 to connect... (Ctrl+C to quit)")

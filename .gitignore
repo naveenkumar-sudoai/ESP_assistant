@@ -6,7 +6,6 @@ venv/
 .venv/
 env/
 laptop_app/notes.md
-laptop_app/debug_audio/
 
 # PlatformIO / Arduino
 .pio/
@@ -17,3 +16,7 @@ build/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# ESP32-mic version (separate folder)
+esp32-mic/laptop/debug_audio/
+esp32-mic/laptop/notes.md

@@ -25,13 +25,6 @@
 
 #include "config.h"
 
-#if AUDIO_SOURCE_ESP32
-#include "mic_i2s.h"
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/queue.h>
-#endif
-
 // ------------------------------------------------------------------ display --
 Adafruit_SSD1306 display(128, 64, &Wire, -1);   // -1 = no hardware reset pin
 
@@ -61,118 +54,6 @@ unsigned long bootIpShownAt     = 0;
 unsigned long redrawIdleAt      = 0;
 unsigned long lastSoundDetectMs = 0;
 unsigned long lastWifiCheck     = 0;
-
-#if AUDIO_SOURCE_ESP32
-// ------------------------------------------------------- on-device audio ----
-// A capture task reads the INMP441 over I2S and pushes 16-bit PCM into a
-// ring-buffer queue; a sender task drains it and POSTs small chunks to the
-// laptop. Two tasks decouple hard-real-time capture from bursty Wi-Fi sends,
-// so the OLED/button/web-server loop does not drop samples under normal
-// conditions. (A network stall longer than the combined queue + DMA buffer —
-// ~2.5 s — will still drop audio; that's inherent to streaming with no local
-// disk. The backpressure keeps the drop bounded rather than unbounded.)
-//
-// The `g_streaming` flag is also the "busy" guard for any future eco/sleep
-// mode: never enter sleep while it is true (and wake on any button).
-void callLaptop(const String &path);   // forward decl (defined below)
-
-typedef struct {
-  uint8_t  data[I2S_CHUNK_SAMPLES * 2];
-  uint16_t len;                        // bytes used; 0 = end-of-stream sentinel
-} AudioBlock;
-
-QueueHandle_t  audioQueue        = NULL;
-TaskHandle_t   captureTaskHandle = NULL;
-TaskHandle_t   senderTaskHandle  = NULL;
-
-volatile bool  micReady          = false;
-volatile bool  g_streaming       = false;   // a capture session is active
-volatile bool  g_stopRequested   = false;   // release pressed or MAX_RECORD_MS hit
-volatile bool  g_cancelSession   = false;   // tap too short -> discard, don't transcribe
-volatile bool  g_maxReached      = false;   // capture auto-stopped on MAX_RECORD_MS
-
-String   g_sessionId   = "";
-uint32_t g_chunkIndex  = 0;
-unsigned long pressStartMs = 0;
-
-// POST one chunk of raw 16-bit PCM to the laptop's /audio_chunk endpoint.
-void postAudioChunk(const String &sid, uint32_t idx, const uint8_t *data, size_t len) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[audio] WiFi down, dropping chunk");
-    return;
-  }
-  HTTPClient http;
-  http.setTimeout(1500);
-  String url = String("http://") + LAPTOP_IP + ":" + String(LAPTOP_PORT) +
-               "/audio_chunk?session=" + sid + "&index=" + String(idx);
-  http.begin(url);
-  http.addHeader("Content-Type", "application/octet-stream");
-  int code = http.POST((uint8_t *)data, len);
-  if (code != 200) Serial.printf("[audio] chunk %u -> %d\n", idx, code);
-  http.end();
-}
-
-// Capture task: I2S -> convert -> ring buffer. Runs at high priority so it is
-// never starved (which would drop DMA samples). Backpressures on a full queue.
-void captureTask(void *arg) {
-  int32_t raw[I2S_READ_SAMPLES];
-  int16_t block[I2S_CHUNK_SAMPLES];
-  while (true) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);        // wait for "start" from loop()
-    uint32_t startMs = millis();
-    int blockLen = 0;                                // samples accumulated in `block`
-    while (!g_stopRequested) {
-      size_t bytesRead = 0;
-      esp_err_t err = i2s_read(I2S_NUM_0, raw, sizeof(raw), &bytesRead, pdMS_TO_TICKS(100));
-      if (err != ESP_OK || bytesRead == 0) continue; // timeout -> re-check stop flag
-      int n = bytesRead / 4;
-      for (int i = 0; i < n; i++) {
-        block[blockLen++] = mic_i2s_convert(raw[i]);
-        if (blockLen == I2S_CHUNK_SAMPLES) {
-          AudioBlock b;
-          b.len = blockLen * 2;
-          memcpy(b.data, block, b.len);
-          xQueueSend(audioQueue, &b, portMAX_DELAY); // backpressure if network is slow
-          blockLen = 0;
-        }
-      }
-      if (millis() - startMs >= MAX_RECORD_MS) {
-        g_stopRequested = true;
-        g_maxReached = true;
-      }
-    }
-    if (blockLen > 0) {                              // flush the partial final block
-      AudioBlock b;
-      b.len = blockLen * 2;
-      memcpy(b.data, block, b.len);
-      xQueueSend(audioQueue, &b, portMAX_DELAY);
-    }
-    AudioBlock end;                                  // end-of-stream sentinel
-    end.len = 0;
-    xQueueSend(audioQueue, &end, portMAX_DELAY);
-  }
-}
-
-// Sender task: drains the ring buffer and POSTs chunks; on the end sentinel it
-// finishes the session by telling the laptop to stop (or cancel) transcription.
-void senderTask(void *arg) {
-  AudioBlock b;
-  while (true) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);        // wait for "start"
-    while (true) {
-      if (xQueueReceive(audioQueue, &b, portMAX_DELAY) != pdTRUE) continue;
-      if (b.len == 0) break;                        // end of stream
-      postAudioChunk(g_sessionId, g_chunkIndex++, b.data, b.len);
-    }
-    if (g_cancelSession) {
-      callLaptop("/cancel?session=" + g_sessionId);
-    } else {
-      callLaptop("/stop_listening?session=" + g_sessionId);
-    }
-    g_streaming = false;                            // ready for the next utterance
-  }
-}
-#endif
 
 // ----------------------------------------------------------------- buttons --
 struct Button {
@@ -342,21 +223,6 @@ void showModeOverlay() {
   redrawIdleAt = millis() + 1200;
 }
 
-#if AUDIO_SOURCE_ESP32
-// Shown briefly after a hold-to-speak tap that was too short to record.
-void showHoldToSpeakHint() {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(WHITE);
-  display.setCursor(0, 16);
-  display.println("Hold to");
-  display.println("speak");
-  display.setTextSize(1);
-  display.display();
-  redrawIdleAt = millis() + 1200;
-}
-#endif
-
 void showResponse(const String &text) {
   responseText = text;
   computeLines(21);
@@ -388,62 +254,18 @@ void cycleMode() {
 
 void startListening() {
   if (state == STATE_LISTENING) return;
-#if AUDIO_SOURCE_ESP32
-  if (g_streaming) return;                     // previous utterance still finishing
-  if (!micReady) {                             // mic init failed -> show error, don't engage
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(WHITE);
-    display.setCursor(0, 0);
-    display.println("Mic init failed");
-    display.println("Check INMP441 wiring");
-    display.println("and 3.3V power.");
-    display.display();
-    return;
-  }
-  state = STATE_LISTENING;
-  redrawIdleAt = 0;
-  drawListening();
-  pressStartMs    = millis();
-  g_sessionId     = String(millis());
-  g_chunkIndex    = 0;
-  g_cancelSession = false;
-  g_stopRequested = false;
-  g_maxReached    = false;
-  g_streaming     = true;
-  xQueueReset(audioQueue);                     // drop any stale blocks
-  callLaptop("/start_listening?session=" + g_sessionId + "&mode=" + String(modeName(mode)));
-  xTaskNotifyGive(captureTaskHandle);
-  xTaskNotifyGive(senderTaskHandle);
-#else
   state = STATE_LISTENING;
   redrawIdleAt = 0;
   drawListening();
   callLaptop("/start_listening?mode=" + String(modeName(mode)));
-#endif
 }
 
 void stopListening() {
   if (state != STATE_LISTENING) return;
-#if AUDIO_SOURCE_ESP32
-  if (!g_streaming) return;                    // never started (e.g. mic init failed)
-  if (millis() - pressStartMs < MIN_RECORD_MS) {
-    g_cancelSession = true;                    // tap too short -> discard, no transcribe
-    g_stopRequested = true;
-    state = STATE_IDLE;
-    showHoldToSpeakHint();
-    return;
-  }
-  g_stopRequested = true;                      // capture flushes; sender POSTs /stop_listening
-  state = STATE_THINKING;
-  thinkingStartedMs = millis();
-  drawThinking();
-#else
   state = STATE_THINKING;
   thinkingStartedMs = millis();
   drawThinking();
   callLaptop("/stop_listening");
-#endif
 }
 
 void handleButtons() {
@@ -626,22 +448,6 @@ void setup() {
 
   connectWiFi();
   setupServer();
-#if AUDIO_SOURCE_ESP32
-  micReady = mic_i2s_init();
-  if (micReady) {
-    audioQueue = xQueueCreate(AUDIO_QUEUE_LEN, sizeof(AudioBlock));
-    BaseType_t c1 = xTaskCreatePinnedToCore(captureTask, "cap", 8192, NULL, 5, &captureTaskHandle, 1);
-    BaseType_t c2 = xTaskCreatePinnedToCore(senderTask,  "snd", 8192, NULL, 3, &senderTaskHandle,  0);
-    if (audioQueue == NULL || c1 != pdPASS || c2 != pdPASS) {
-      Serial.println("[audio] queue/task setup failed — audio disabled");
-      micReady = false;
-    } else {
-      Serial.println("[audio] capture + sender tasks started");
-    }
-  } else {
-    Serial.println("[i2s] INMP441 init FAILED — audio disabled");
-  }
-#endif
   showReadyIp();
   bootIpShownAt = millis();
   state = STATE_BOOT;
@@ -657,16 +463,6 @@ void loop() {
   }
 
   handleButtons();
-#if AUDIO_SOURCE_ESP32
-  if (g_maxReached) {                          // capture hit MAX_RECORD_MS: move UI to "Thinking"
-    g_maxReached = false;
-    if (state == STATE_LISTENING) {
-      state = STATE_THINKING;
-      thinkingStartedMs = millis();
-      drawThinking();
-    }
-  }
-#endif
   updateLed();
   updateDisplayState();
 
