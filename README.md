@@ -15,6 +15,10 @@ No cloud server, no app store, no accounts beyond a DeepSeek API key.
 > **Want the on-device microphone (INMP441) version?** See the
 > [`esp32-mic/`](esp32-mic/) folder — same assistant, but the mic is on the
 > ESP32 instead of the laptop. It's wired, flashed, and documented separately.
+>
+> **Want the simplest version (OLED only, no buttons)?** See the
+> [`simple-oled/`](simple-oled/) folder — ESP32 + OLED, laptop mic, and DeepSeek
+> auto-decides question vs. summarize vs. to-do.
 
 ---
 
